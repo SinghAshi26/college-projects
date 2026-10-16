@@ -13,7 +13,7 @@ from urllib.parse import quote
 import pandas as pd
 import streamlit as st
 
-from lead_finder import get_monthly_usage, lead_type, search
+from lead_finder import PlacesSearchError, get_monthly_usage, lead_type, search
 from templates import TEMPLATES, api_benefit, format_email, format_message
 from ui import apply_custom_css, render_header, render_metrics
 from website_audit import audit_batch
@@ -228,7 +228,7 @@ with st.sidebar:
     env_google_key = secret("GOOGLE_API_KEY")
     if env_google_key:
         api_key = env_google_key
-        st.success("Google Places API: Configured securely")
+        st.info("Google Places API key loaded; access is checked when you search.")
     else:
         api_key = st.text_input(
             "Google Places API Key",
@@ -290,6 +290,9 @@ tab_find, tab_audit, tab_whatsapp, tab_email, tab_export = st.tabs(
 # -------------------- TAB 1: FIND LEADS --------------------
 with tab_find:
     st.subheader("1. Search Google Places")
+    search_warning = st.session_state.pop("search_warning", None)
+    if search_warning:
+        st.warning(search_warning)
     c1, c2, c3 = st.columns([3, 3, 1])
     category_in = c1.text_input("Business Category", placeholder="e.g. coaching center, dental clinic, restaurant")
     city_in = c2.text_input("City or Neighborhood", placeholder="e.g. Lucknow Gomti Nagar, Noida Sector 62")
@@ -302,14 +305,23 @@ with tab_find:
                 f"Search blocked: Monthly Places API calls ({current_calls}) have reached or exceeded "
                 f"your safety limit of {hard_limit}. Adjust the limit in the sidebar if you wish to proceed."
             )
-        elif not api_key:
+        elif not api_key.strip():
             st.error("Google Places API Key is missing. Please configure it in the sidebar settings.")
         elif not category_in.strip() or not city_in.strip():
             st.error("Please provide both a business category and a target city/area.")
         else:
             with st.spinner("Searching Google Places API for verified listings..."):
                 query_str = f"{category_in.strip()} in {city_in.strip()}"
-                places = search(query_str, api_key, pages_in, usage_limit=hard_limit)
+                try:
+                    places = search(query_str, api_key, pages_in, usage_limit=hard_limit)
+                except PlacesSearchError as exc:
+                    places = exc.partial_results or None
+                    if places:
+                        st.session_state["search_warning"] = (
+                            f"Search was incomplete. Kept {len(places)} leads from completed pages. {exc}"
+                        )
+                    else:
+                        st.error(str(exc))
 
             if places:
                 new_rows = []
@@ -355,8 +367,8 @@ with tab_find:
                 st.session_state.leads = deduped
                 st.success(f"Retrieved {len(new_rows)} leads. Total unique leads in session: {len(deduped)}.")
                 st.rerun()
-            else:
-                st.warning("No listings found. Please verify your query, location, and Google API billing setup.")
+            elif places is not None:
+                st.warning("Google Places returned no matching listings. Try a broader business category or nearby city/area.")
 
     st.markdown("---")
     st.subheader("Current Leads")

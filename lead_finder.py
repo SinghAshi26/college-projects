@@ -119,6 +119,55 @@ def lead_type(website: str) -> str:
     return "Check website"
 
 
+class PlacesSearchError(RuntimeError):
+    """A failed search, with any leads already retrieved from earlier pages."""
+
+    def __init__(self, message: str, partial_results: Optional[List[Dict[str, Any]]] = None):
+        super().__init__(message)
+        self.partial_results = list(partial_results or [])
+
+
+def _api_error_message(response: requests.Response, api_key: str) -> str:
+    """Expose Google's useful error details without exposing the API key."""
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+    error = payload.get("error", {}) if isinstance(payload, dict) else {}
+    if not isinstance(error, dict):
+        error = {}
+    message = str(error.get("message") or "Google returned an unsuccessful response.")
+    status = str(error.get("status") or "UNKNOWN")
+    details = error.get("details", [])
+    reasons = " ".join(
+        str(item.get("reason", "")) for item in details if isinstance(item, dict)
+    ) if isinstance(details, list) else ""
+    diagnostic = f"{status} {reasons} {message}".lower()
+
+    if "billing" in diagnostic:
+        hint = "Enable billing on the Google Cloud project that owns this API key."
+    elif "service_disabled" in diagnostic or "has not been used" in diagnostic:
+        hint = "Enable Places API (New) in the Google Cloud project that owns this API key."
+    elif "api_key_invalid" in diagnostic or "api key not valid" in diagnostic:
+        hint = "Replace GOOGLE_API_KEY in your app settings with a valid Google Cloud API key."
+    elif any(word in diagnostic for word in ("blocked", "referer", "referrer", "restriction")):
+        hint = (
+            "Check this key's restrictions: allow Places API (New) and the app server's public IP. "
+            "Website referrer restrictions do not work for this server-side search."
+        )
+    elif response.status_code == 429 or "resource_exhausted" in diagnostic:
+        hint = "Check your Places API quota in Google Cloud Console and retry after the rate limit resets."
+    elif response.status_code in (401, 403):
+        hint = "Check the API key, Places API (New) enablement, billing, and key restrictions in its Google Cloud project."
+    elif response.status_code >= 500:
+        hint = "Google Places is temporarily unavailable. Please try again shortly."
+    else:
+        hint = "Review the Google error above and check your search settings."
+    return f"Google Places API error (HTTP {response.status_code}, {status}): {message} {hint}".replace(
+        api_key, "[REDACTED]"
+    )
+
+
 def search(
     query: str,
     api_key: str,
@@ -128,7 +177,14 @@ def search(
     """
     Search Google Places API for businesses matching the query.
     Respects optional monthly usage limits and records all calls.
+    Raises PlacesSearchError on failure; only successful empty searches return [].
     """
+    api_key = api_key.strip()
+    query = query.strip()
+    if not api_key:
+        raise PlacesSearchError("Google Places API key is missing. Configure GOOGLE_API_KEY or enter it in the sidebar.")
+    if not query or max_pages < 1:
+        raise PlacesSearchError("Provide a search query and request at least one page.")
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": api_key,
@@ -140,19 +196,31 @@ def search(
     for _ in range(max_pages):
         current_used, _ = get_monthly_usage()
         if usage_limit is not None and current_used >= usage_limit:
-            print(
-                f"Places API monthly call threshold reached ({current_used} >= {usage_limit}). Stopping further searches.",
-                file=sys.stderr,
+            raise PlacesSearchError(
+                f"Search stopped: monthly Places API calls ({current_used}) reached your app safety limit ({usage_limit}). "
+                "Review the usage limit in the sidebar before searching again.",
+                results,
             )
-            break
 
-        r = requests.post(URL, json=body, headers=headers, timeout=30)
-        record_api_call(1)
+        try:
+            r = requests.post(URL, json=body, headers=headers, timeout=30)
+        except requests.Timeout:
+            raise PlacesSearchError("Google Places search timed out. Please try again shortly.", results) from None
+        except requests.RequestException:
+            raise PlacesSearchError(
+                "Could not connect to Google Places. Check the app server's internet connection and try again.", results
+            ) from None
+        finally:
+            record_api_call(1)
 
         if r.status_code != 200:
-            print(f"Places API error ({r.status_code}): {r.text[:400]}", file=sys.stderr)
-            break
-        data = r.json()
+            raise PlacesSearchError(_api_error_message(r, api_key), results)
+        try:
+            data = r.json()
+        except ValueError:
+            raise PlacesSearchError("Google Places returned an invalid response. Please try again shortly.", results) from None
+        if not isinstance(data, dict) or not isinstance(data.get("places", []), list):
+            raise PlacesSearchError("Google Places returned an invalid response. Please try again shortly.", results)
         results.extend(data.get("places", []))
         token = data.get("nextPageToken")
         if not token:
@@ -177,7 +245,13 @@ def main() -> None:
 
     query = f"{args.category} in {args.city}"
     print(f"Searching: {query}")
-    places = search(query, api_key, min(args.max_pages, 3))
+    try:
+        places = search(query, api_key, min(args.max_pages, 3))
+    except PlacesSearchError as exc:
+        if not exc.partial_results:
+            sys.exit(str(exc))
+        places = exc.partial_results
+        print(f"Warning: {exc} Saving {len(places)} leads from completed pages.", file=sys.stderr)
     print(f"Found {len(places)} businesses.")
 
     seen = set()
