@@ -31,6 +31,10 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from configuration import config_value
+
+from http_tracking import request_tracking, tracked_http
+from storage import StorageError
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; AppnixAudit/1.0; +https://appnix.org)"}
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
@@ -64,12 +68,14 @@ CONTACT_HINTS = ("contact", "about", "reach", "support", "privacy")
 def get(url: str, timeout: int = 10, retries: int = 1) -> Tuple[requests.Response, float]:
     """Fetch URL with timeout and limited retries, measuring response duration in seconds."""
     last_err: Optional[Exception] = None
-    for _ in range(retries + 1):
+    for attempt in range(retries + 1):
         try:
             start = time.time()
-            r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
+            r = tracked_http("GET", url, attempt=attempt + 1, headers=HEADERS, timeout=timeout, allow_redirects=True)
             return r, round(time.time() - start, 2)
-        except Exception as e:
+        except StorageError:
+            raise
+        except requests.RequestException as e:
             last_err = e
             time.sleep(0.5)
     raise last_err or Exception(f"Failed to fetch {url}")
@@ -137,11 +143,15 @@ def check_broken_links(soup: BeautifulSoup, base_url: str, max_check: int = 15) 
     broken_count = 0
     for link in list(internal_links)[:max_check]:
         try:
-            r = requests.head(link, headers=HEADERS, timeout=4, allow_redirects=True)
+            r = tracked_http("HEAD", link, headers=HEADERS, timeout=4, allow_redirects=True)
             if r.status_code == 405:  # Method Not Allowed for HEAD, try GET
-                r = requests.get(link, headers=HEADERS, timeout=4, stream=True, allow_redirects=True)
+                r.close()
+                r = tracked_http("GET", link, headers=HEADERS, timeout=4, stream=True, allow_redirects=True)
             if r.status_code >= 400:
                 broken_count += 1
+            r.close()
+        except StorageError:
+            raise
         except Exception:
             broken_count += 1
     return broken_count
@@ -268,7 +278,8 @@ def psi_metrics(url: str, key: str) -> Dict[str, Any]:
     out: Dict[str, Any] = {"score": "", "lcp_sec": "", "cls": ""}
     api = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
     try:
-        r = requests.get(api, params={"url": url, "strategy": "mobile", "key": key}, timeout=45)
+        r = tracked_http("GET", api, provider="google_pagespeed", operation="performance",
+                         params={"url": url, "strategy": "mobile", "key": key}, timeout=45, allow_redirects=False)
         if r.status_code == 429:
             return out
         if r.status_code != 200:
@@ -288,6 +299,8 @@ def psi_metrics(url: str, key: str) -> Dict[str, Any]:
         cls_val = audits.get("cumulative-layout-shift", {}).get("numericValue")
         if cls_val is not None:
             out["cls"] = f"{round(cls_val, 2)}"
+    except StorageError:
+        raise
     except Exception:
         pass
     return out
@@ -343,6 +356,8 @@ def audit(url: str, use_psi: bool = False, psi_key: Optional[str] = None) -> Dic
 
     try:
         r, secs = get(url, timeout=10)
+    except StorageError:
+        raise
     except Exception:
         out["problem_en"] = "Website unreachable or down"
         out["problem_hi"] = "Website khul nahi rahi / down hai"
@@ -561,6 +576,8 @@ def audit(url: str, use_psi: bool = False, psi_key: Optional[str] = None) -> Dic
                     combined_emails.update(sub_emails)
                     email_source = "contact page"
                     break
+            except StorageError:
+                raise
             except Exception:
                 pass
 
@@ -619,6 +636,8 @@ def audit_batch(
     max_workers: int = 4,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     cache: Optional[Dict[str, Dict[str, Any]]] = None,
+    store=None,
+    result_callback=None,
 ) -> List[Dict[str, Any]]:
     """
     Run audits across a list of leads using a thread pool (max 4 workers).
@@ -653,7 +672,8 @@ def audit_batch(
         lead_data = results[idx]
         site_url = lead_data.get("website", "")
         is_real = site_url and not str(lead_data.get("lead_type", "")).startswith("HOT")
-        res = audit(site_url if is_real else "", use_psi, psi_key)
+        with request_tracking(store):
+            res = audit(site_url if is_real else "", use_psi, psi_key)
         return idx, res
 
     workers = min(max_workers, len(to_audit_indices) or 1)
@@ -670,6 +690,9 @@ def audit_batch(
             if domain:
                 cache[domain] = audit_result
 
+            if result_callback:
+                result_callback(results[idx])
+
             completed_count += 1
             if progress_callback:
                 progress_callback(completed_count, total, results[idx].get("name", "")[:35])
@@ -685,7 +708,7 @@ def main() -> None:
     ap.add_argument("--psi", action="store_true", help="Include Google PageSpeed Insights score")
     args = ap.parse_args()
 
-    psi_key = os.environ.get("PSI_API_KEY")
+    psi_key = config_value("PSI_API_KEY")
     if args.psi and not psi_key:
         sys.exit("Error: PSI_API_KEY environment variable is required when using --psi flag.")
 
@@ -723,10 +746,14 @@ def main() -> None:
     def progress(done: int, total: int, name: str) -> None:
         print(f"[{done}/{total}] Audited: {name}")
 
-    audited_rows = audit_batch(rows, use_psi=args.psi, psi_key=psi_key, progress_callback=progress)
+    from configuration import configured_store
+    try:
+        audited_rows = audit_batch(rows, use_psi=args.psi, psi_key=psi_key, progress_callback=progress, store=configured_store())
+    except StorageError as exc:
+        sys.exit(str(exc))
 
     with open(args.out, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         w.writeheader()
         w.writerows(audited_rows)
 

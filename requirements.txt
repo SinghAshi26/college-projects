@@ -1,4 +1,6 @@
-streamlit
-pandas
-requests
-beautifulsoup4
+streamlit==1.66.0
+pandas==3.0.6
+requests==2.34.2
+beautifulsoup4==4.15.0
+psycopg[binary]==3.3.6
+python-dotenv==1.2.4

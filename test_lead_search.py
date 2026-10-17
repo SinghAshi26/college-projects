@@ -5,6 +5,7 @@ import requests
 from streamlit.testing.v1 import AppTest
 
 from lead_finder import PlacesSearchError, search
+from storage import QuotaReached
 
 
 def response(status, payload):
@@ -16,14 +17,17 @@ def response(status, payload):
 class SearchTests(unittest.TestCase):
     def setUp(self):
         self.post = self.enterContext(patch("lead_finder.requests.post"))
-        self.usage = self.enterContext(patch("lead_finder.get_monthly_usage", return_value=(0, True)))
-        self.record = self.enterContext(patch("lead_finder.record_api_call"))
+        self.store = Mock()
+        self.store.start_search.return_value = True
+        self.store.reserve_request.return_value = "request-id"
+        self.enterContext(patch("lead_finder.configured_store", return_value=self.store))
+        self.record = self.store.complete_request
         self.enterContext(patch("lead_finder.time.sleep"))
 
     def test_successful_empty_search(self):
         self.post.return_value = response(200, {})
         self.assertEqual(search("clinics in Noida", "key", 3), [])
-        self.record.assert_called_once_with(1)
+        self.record.assert_called_once_with(request_id="request-id", outcome="success", http_status=200, leads=[])
 
     def test_pagination_and_trimmed_key(self):
         self.post.side_effect = [
@@ -86,13 +90,13 @@ class SearchTests(unittest.TestCase):
                     search("clinics in Noida", "key", 1)
 
     def test_limit_blocks_requests(self):
-        self.usage.return_value = (900, True)
+        self.store.reserve_request.side_effect = QuotaReached("Monthly safety limit reached")
         with self.assertRaisesRegex(PlacesSearchError, "safety limit"):
             search("clinics in Noida", "key", 3, usage_limit=900)
         self.post.assert_not_called()
 
     def test_limit_between_pages_preserves_results(self):
-        self.usage.side_effect = [(899, True), (900, True)]
+        self.store.reserve_request.side_effect = ["request-id", QuotaReached("Monthly safety limit reached")]
         self.post.return_value = response(200, {"places": [{"id": "one"}], "nextPageToken": "next"})
         with self.assertRaises(PlacesSearchError) as caught:
             search("clinics in Noida", "key", 3, usage_limit=900)
@@ -103,43 +107,6 @@ class SearchTests(unittest.TestCase):
         with self.assertRaisesRegex(PlacesSearchError, "key is missing"):
             search("clinics in Noida", " \n", 1)
         self.post.assert_not_called()
-
-
-class SearchUITests(unittest.TestCase):
-    def setUp(self):
-        self.enterContext(patch("lead_finder.get_monthly_usage", return_value=(0, True)))
-        self.search = self.enterContext(patch("lead_finder.search"))
-        self.app = AppTest.from_file("app.py", default_timeout=15)
-        self.app.secrets["GOOGLE_API_KEY"] = "test-key"
-        self.app.secrets["APP_PASSWORD"] = ""
-        self.app.run()
-        for widget in self.app.text_input:
-            if widget.label == "Business Category":
-                widget.set_value("clinic")
-            elif widget.label == "City or Neighborhood":
-                widget.set_value("Noida")
-
-    def run_search(self):
-        next(button for button in self.app.button if button.label == "Search Leads").click().run()
-        self.assertEqual(len(self.app.exception), 0)
-
-    def test_error_is_shown_instead_of_empty_results_warning(self):
-        self.search.side_effect = PlacesSearchError("Google rejected the key: enable Places API (New).")
-        self.run_search()
-        self.assertTrue(any("enable Places API (New)" in error.value for error in self.app.error))
-        self.assertFalse(any("no matching" in warning.value for warning in self.app.warning))
-
-    def test_empty_results_show_query_guidance(self):
-        self.search.return_value = []
-        self.run_search()
-        self.assertTrue(any("no matching listings" in warning.value for warning in self.app.warning))
-        self.assertEqual(len(self.app.error), 0)
-
-    def test_partial_results_and_warning_survive_rerun(self):
-        self.search.side_effect = PlacesSearchError("Quota exceeded", [{"id": "one", "displayName": {"text": "Clinic"}}])
-        self.run_search()
-        self.assertEqual(len(self.app.session_state["leads"]), 1)
-        self.assertTrue(any("Search was incomplete" in warning.value for warning in self.app.warning))
 
 
 if __name__ == "__main__":

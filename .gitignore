@@ -4,3 +4,13 @@ secrets.toml
 *.csv
 __pycache__/
 .env
+.env.*
+!.env.example
+.test-postgres/
+.test-artifacts/
+*.pem
+*.crt
+*.cer
+.venv/
+.venv*/
+hf_space/

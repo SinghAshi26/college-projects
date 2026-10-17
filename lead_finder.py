@@ -2,7 +2,8 @@
 Appnix Local Lead Finder
 ------------------------
 Extracts local business listings via Google Places API (New) and saves them to CSV.
-Tracks Places API call volumes in usage.json with in-memory fallback for read-only environments.
+Persists leads, search history and request accounting in PostgreSQL.
+Legacy JSON helpers remain for backward compatibility, but do not govern new searches.
 
 Setup:
     pip install requests
@@ -21,9 +22,13 @@ import json
 import os
 import sys
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+
+from configuration import config_value, configured_store
+from storage import QuotaReached, StorageError
 
 URL = "https://places.googleapis.com/v1/places:searchText"
 USAGE_FILE = "usage.json"
@@ -71,6 +76,7 @@ def get_monthly_usage(month: Optional[str] = None) -> Tuple[int, bool]:
     """
     Get the number of Google Places API calls made for the given month.
     Returns (calls_count, is_persistent_storage).
+    Legacy history only: new searches use Store.usage() instead.
     """
     m_key = month or _current_month_key()
     if os.path.exists(USAGE_FILE):
@@ -89,6 +95,7 @@ def record_api_call(count: int = 1, month: Optional[str] = None) -> Tuple[int, b
     """
     Increment monthly API call counter and persist to usage.json if writable.
     Returns (new_count, is_persistent).
+    Legacy compatibility only: never called by the tracked search path.
     """
     m_key = month or _current_month_key()
     current_calls, is_file = get_monthly_usage(m_key)
@@ -125,6 +132,22 @@ class PlacesSearchError(RuntimeError):
     def __init__(self, message: str, partial_results: Optional[List[Dict[str, Any]]] = None):
         super().__init__(message)
         self.partial_results = list(partial_results or [])
+        self.pending_completion = None
+        self.search_id = None
+
+
+def place_to_lead(place, category="", city=""):
+    """Map provider results to the existing lead schema without dropping audit fields."""
+    from lead_model import CSV_COLUMNS
+    lead = dict.fromkeys(CSV_COLUMNS, "")
+    site = place.get("websiteUri", "")
+    lead.update(name=place.get("displayName", {}).get("text", ""), category=category,
+                city=city, phone=place.get("nationalPhoneNumber", ""), website=site,
+                lead_type=lead_type(site), rating=place.get("rating", ""),
+                reviews=place.get("userRatingCount", ""), address=place.get("formattedAddress", ""),
+                maps_link=place.get("googleMapsUri", ""), place_id=place.get("id", ""),
+                status="New", broken_links=0, audit_score=0)
+    return lead
 
 
 def _api_error_message(response: requests.Response, api_key: str) -> str:
@@ -149,7 +172,7 @@ def _api_error_message(response: requests.Response, api_key: str) -> str:
     elif "service_disabled" in diagnostic or "has not been used" in diagnostic:
         hint = "Enable Places API (New) in the Google Cloud project that owns this API key."
     elif "api_key_invalid" in diagnostic or "api key not valid" in diagnostic:
-        hint = "Replace GOOGLE_API_KEY in your app settings with a valid Google Cloud API key."
+        hint = "Google rejected the API key: Replace GOOGLE_API_KEY in your app settings with a valid Google Cloud API key."
     elif any(word in diagnostic for word in ("blocked", "referer", "referrer", "restriction")):
         hint = (
             "Check this key's restrictions: allow Places API (New) and the app server's public IP. "
@@ -173,18 +196,24 @@ def search(
     api_key: str,
     max_pages: int,
     usage_limit: Optional[int] = None,
+    *,
+    store=None,
+    category: str = "",
+    city: str = "",
+    search_id: Optional[str] = None,
+    progress_callback=None,
 ) -> List[Dict[str, Any]]:
     """
     Search Google Places API for businesses matching the query.
     Respects optional monthly usage limits and records all calls.
     Raises PlacesSearchError on failure; only successful empty searches return [].
     """
-    api_key = api_key.strip()
+    api_key = api_key.strip().strip("'\"")
     query = query.strip()
     if not api_key:
         raise PlacesSearchError("Google Places API key is missing. Configure GOOGLE_API_KEY or enter it in the sidebar.")
-    if not query or max_pages < 1:
-        raise PlacesSearchError("Provide a search query and request at least one page.")
+    if not query or not 1 <= max_pages <= 3:
+        raise PlacesSearchError("Provide a search query and request one to three pages.")
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": api_key,
@@ -193,40 +222,74 @@ def search(
     body: Dict[str, Any] = {"textQuery": query, "pageSize": 20, "regionCode": "IN"}
     results: List[Dict[str, Any]] = []
 
-    for _ in range(max_pages):
-        current_used, _ = get_monthly_usage()
-        if usage_limit is not None and current_used >= usage_limit:
-            raise PlacesSearchError(
-                f"Search stopped: monthly Places API calls ({current_used}) reached your app safety limit ({usage_limit}). "
-                "Review the usage limit in the sidebar before searching again.",
-                results,
-            )
-
-        try:
-            r = requests.post(URL, json=body, headers=headers, timeout=30)
-        except requests.Timeout:
-            raise PlacesSearchError("Google Places search timed out. Please try again shortly.", results) from None
-        except requests.RequestException:
-            raise PlacesSearchError(
-                "Could not connect to Google Places. Check the app server's internet connection and try again.", results
-            ) from None
-        finally:
-            record_api_call(1)
-
-        if r.status_code != 200:
-            raise PlacesSearchError(_api_error_message(r, api_key), results)
-        try:
-            data = r.json()
-        except ValueError:
-            raise PlacesSearchError("Google Places returned an invalid response. Please try again shortly.", results) from None
-        if not isinstance(data, dict) or not isinstance(data.get("places", []), list):
-            raise PlacesSearchError("Google Places returned an invalid response. Please try again shortly.", results)
-        results.extend(data.get("places", []))
-        token = data.get("nextPageToken")
-        if not token:
-            break
-        body["pageToken"] = token
-        time.sleep(2)  # Wait for Google token propagation
+    search_id = search_id or str(uuid.uuid4())
+    pending = None
+    error_category = "provider"
+    started = False
+    try:
+        store = store or configured_store()
+        started = store.start_search(search_id, category or query, city, max_pages)
+        if not started:
+            raise PlacesSearchError("This search submission was already recorded. Refresh saved leads before starting another search.")
+        for page in range(max_pages):
+            request_id = store.reserve_request("google_places", "text_search", search_id, monthly_cap=usage_limit)
+            pending = {"request_id":request_id, "outcome":"network_error"}
+            try:
+                r = requests.post(URL, json=body, headers=headers, timeout=30, allow_redirects=False)
+            except requests.Timeout:
+                pending["outcome"] = "timeout"
+                store.complete_request(**pending)
+                pending = None
+                error_category = "network"
+                raise PlacesSearchError("Business search timed out. Please try again shortly.", results) from None
+            except requests.RequestException:
+                store.complete_request(**pending)
+                pending = None
+                error_category = "network"
+                raise PlacesSearchError("Could not connect to the business search provider. Check the server connection and try again.", results) from None
+            pending.update(http_status=r.status_code, outcome="http_error")
+            if r.status_code != 200:
+                store.complete_request(**pending)
+                pending = None
+                raise PlacesSearchError(_api_error_message(r, api_key), results)
+            pending["outcome"] = "invalid_response"
+            try:
+                data = r.json()
+                if not isinstance(data, dict) or not isinstance(data.get("places", []), list) or any(not isinstance(p, dict) for p in data.get("places", [])):
+                    raise ValueError("Invalid response shape")
+            except ValueError:
+                store.complete_request(**pending)
+                pending = None
+                error_category = "invalid_response"
+                raise PlacesSearchError("The search provider returned an invalid response. Please try again shortly.", results) from None
+            results.extend(data.get("places", []))
+            pending.update(outcome="success", leads=[place_to_lead(p, category, city) for p in data.get("places", [])])
+            # Each page's leads, counters and request outcome commit together, before fetching another page.
+            store.complete_request(**pending)
+            pending = None
+            if progress_callback:
+                progress_callback(page + 1, max_pages, len(results))
+            token = data.get("nextPageToken")
+            if not token:
+                break
+            body["pageToken"] = token
+            if page + 1 < max_pages:
+                time.sleep(2)
+        store.finish_search(search_id, "success")
+    except (StorageError, PlacesSearchError) as cause:
+        if isinstance(cause, QuotaReached):
+            error_category = "quota"
+        elif isinstance(cause, StorageError):
+            error_category = "database"
+        exc = cause if isinstance(cause, PlacesSearchError) else PlacesSearchError(str(cause), results)
+        exc.pending_completion = pending
+        exc.search_id = search_id
+        if started:
+            try:
+                store.finish_search(search_id, "partial" if results else "blocked" if error_category == "quota" else "failed", error_category)
+            except StorageError:
+                exc.args = (str(exc) + " Search history could not be finalized; its recorded status may remain running.",)
+        raise exc from None
     return results
 
 
@@ -239,14 +302,14 @@ def main() -> None:
     ap.add_argument("--out", default="leads.csv", help="Output CSV filepath")
     args = ap.parse_args()
 
-    api_key = os.environ.get("GOOGLE_API_KEY")
+    api_key = config_value("GOOGLE_API_KEY")
     if not api_key:
         sys.exit("Error: GOOGLE_API_KEY environment variable is not set. Please configure your key.")
 
     query = f"{args.category} in {args.city}"
     print(f"Searching: {query}")
     try:
-        places = search(query, api_key, min(args.max_pages, 3))
+        places = search(query, api_key, min(args.max_pages, 3), category=args.category, city=args.city)
     except PlacesSearchError as exc:
         if not exc.partial_results:
             sys.exit(str(exc))
@@ -307,9 +370,7 @@ def main() -> None:
     print(f"Saved {new_count} new leads to {args.out}.")
     hot = sum(1 for p in places if lead_type(p.get("websiteUri", "")).startswith("HOT"))
     print(f"{hot} leads classified as 'HOT' (no website or social-only link).")
-    calls, persistent = get_monthly_usage()
-    storage_type = "file" if persistent else "in-memory"
-    print(f"Total Places API calls used this month: {calls} ({storage_type}).")
+    print("Search requests and retrieved leads are recorded in the configured database.")
 
 
 if __name__ == "__main__":
